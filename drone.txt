@@ -1,3 +1,4 @@
+//                                                                                                           🔥 CODE BY SIDDHARTHAN & SHRI HARI 🔥
 /*
  * ESP32-CAM Drone Controller
  * 
@@ -9,7 +10,7 @@
  * - Web interface with voice control
  * - WiFi AP mode for remote control
  */
-// CODE BY SIDDHARTHAN & SHRI HARI
+
 // ============================================================================
 // INCLUDES
 // ============================================================================
@@ -606,3 +607,4 @@ void loop() {
     delay(50); // 20Hz control loop
 
 }
+
