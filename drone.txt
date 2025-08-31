@@ -1,0 +1,607 @@
+/*
+ * ESP32-CAM Drone Controller
+ * 
+ * Features:
+ * - Camera streaming
+ * - Line following using computer vision
+ * - Obstacle avoidance with ToF sensor
+ * - MAVLink communication with flight controller
+ * - Web interface with voice control
+ * - WiFi AP mode for remote control
+ */
+
+// ============================================================================
+// INCLUDES
+// ============================================================================
+#include "esp_camera.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HardwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
+#include "mavlink/common/mavlink.h"
+
+// ============================================================================
+// CAMERA PIN DEFINITIONS (ESP32-CAM AI-Thinker)
+// ============================================================================
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+// ============================================================================
+// UART PINS FOR MAVLINK COMMUNICATION
+// ============================================================================
+#define RXD2 16
+#define TXD2 17
+
+// ============================================================================
+// CONFIGURATION CONSTANTS
+// ============================================================================
+const char* WIFI_SSID = "ESP32CAM_Drone";
+const char* WIFI_PASSWORD = "esp32pixhawk";
+const int MAVLINK_BAUD_RATE = 57600;
+const int SERIAL_BAUD_RATE = 115200;
+const int TOF_OBSTACLE_DISTANCE = 800; // mm
+const int THROTTLE_STEP = 50;
+const int RC_CENTER = 1500;
+const int RC_THROTTLE_MIN = 1200;
+
+// ============================================================================
+// GLOBAL OBJECTS
+// ============================================================================
+WebServer server(80);
+HardwareSerial pixhawkSerial(2);
+Adafruit_VL53L0X tofSensor = Adafruit_VL53L0X();
+
+// ============================================================================
+// STATE VARIABLES
+// ============================================================================
+struct DroneState {
+  bool armed = false;
+  bool lineFollowEnabled = false;
+  bool obstacleAvoidanceEnabled = false;
+  int baseThrottle = 1400;
+  bool tofSensorReady = false;
+};
+
+DroneState droneState;
+
+// ============================================================================
+// HTML WEB INTERFACE
+// ============================================================================
+const char* INDEX_HTML PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ESP32 Drone Controller</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            text-align: center; 
+            background: #111; 
+            color: white; 
+            margin: 0; 
+            padding: 20px; 
+        }
+        .container { 
+            max-width: 600px; 
+            margin: 0 auto; 
+        }
+        h1 { 
+            color: #4CAF50; 
+            margin-bottom: 30px; 
+        }
+        button { 
+            padding: 12px 20px; 
+            margin: 6px; 
+            border: none; 
+            border-radius: 12px; 
+            font-size: 16px; 
+            cursor: pointer; 
+            background: #4CAF50; 
+            color: white; 
+            transition: background 0.3s;
+        }
+        button:hover { 
+            background: #45a049; 
+        }
+        button:active { 
+            background: #3e8e41; 
+        }
+        .danger { 
+            background: #f44336; 
+        }
+        .danger:hover { 
+            background: #da190b; 
+        }
+        #video { 
+            width: 100%; 
+            max-width: 480px; 
+            border-radius: 12px; 
+            margin: 20px 0;
+        }
+        .control-section { 
+            margin: 20px 0; 
+            padding: 15px; 
+            background: #222; 
+            border-radius: 10px; 
+        }
+        .control-section h3 { 
+            margin-top: 0; 
+            color: #4CAF50; 
+        }
+        #voiceStatus { 
+            margin: 10px 0; 
+            font-size: 14px; 
+            color: #ccc; 
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚁 ESP32-CAM Drone Controller</h1>
+        
+        <div class="control-section">
+            <h3>📹 Video Stream</h3>
+            <img id="video" src="/stream" alt="Camera Stream">
+        </div>
+        
+        <div class="control-section">
+            <h3>🛡️ Safety Controls</h3>
+            <button onclick="sendCmd('arm')">ARM</button>
+            <button onclick="sendCmd('disarm')" class="danger">DISARM</button>
+            <button onclick="sendCmd('stop')" class="danger">EMERGENCY STOP</button>
+        </div>
+        
+        <div class="control-section">
+            <h3>🎯 Flight Modes</h3>
+            <button onclick="sendCmd('line_on')">Line Follow ON</button>
+            <button onclick="sendCmd('line_off')">Line Follow OFF</button>
+            <button onclick="sendCmd('toggle_obstacle')">Toggle Obstacle Avoidance</button>
+        </div>
+        
+        <div class="control-section">
+            <h3>⚡ Throttle Control</h3>
+            <button onclick="sendCmd('throttle_up')">Throttle +</button>
+            <button onclick="sendCmd('throttle_down')">Throttle -</button>
+        </div>
+        
+        <div class="control-section">
+            <h3>🎤 Voice Control</h3>
+            <button id="micBtn">🎤 Voice Command</button>
+            <div id="voiceStatus">Voice: Ready</div>
+            <div style="font-size: 12px; color: #888; margin-top: 10px;">
+                Commands: "arm", "disarm", "line follow on/off", "toggle obstacle", "stop", "throttle up/down"
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function sendCmd(cmd) {
+            fetch('/api/' + cmd)
+                .then(response => response.text())
+                .then(data => console.log('Command sent:', cmd, 'Response:', data))
+                .catch(error => console.error('Error:', error));
+        }
+
+        // Voice recognition setup
+        let recognition;
+        if ('webkitSpeechRecognition' in window) {
+            recognition = new webkitSpeechRecognition();
+            recognition.continuous = false;
+            recognition.lang = "en-US";
+            recognition.interimResults = false;
+            
+            recognition.onresult = function(event) {
+                let transcript = event.results[0][0].transcript.toLowerCase();
+                document.getElementById("voiceStatus").innerText = "Heard: " + transcript;
+                fetch('/api/voice?cmd=' + encodeURIComponent(transcript))
+                    .then(response => response.text())
+                    .then(data => console.log('Voice command processed:', transcript));
+            };
+            
+            recognition.onerror = function(event) {
+                document.getElementById("voiceStatus").innerText = "Voice error: " + event.error;
+            };
+            
+            recognition.onend = function() {
+                document.getElementById("voiceStatus").innerText = "Voice: Ready";
+            };
+        } else {
+            document.getElementById("micBtn").disabled = true;
+            document.getElementById("voiceStatus").innerText = "Voice recognition not supported";
+        }
+
+        document.getElementById("micBtn").onclick = function() {
+            if (recognition) {
+                recognition.start();
+                document.getElementById("voiceStatus").innerText = "Listening...";
+            }
+        };
+
+        // Refresh video stream on error
+        document.getElementById("video").onerror = function() {
+            setTimeout(() => {
+                this.src = "/stream?" + new Date().getTime();
+            }, 1000);
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================================
+// MAVLINK FUNCTIONS
+// ============================================================================
+void sendRcOverride(int roll, int pitch, int throttle, int yaw) {
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    
+    // Constrain values to valid RC range
+    roll = constrain(roll, 1000, 2000);
+    pitch = constrain(pitch, 1000, 2000);
+    throttle = constrain(throttle, 1000, 2000);
+    yaw = constrain(yaw, 1000, 2000);
+    
+    mavlink_msg_rc_channels_override_pack(
+        1,    // system_id
+        200,  // component_id
+        &msg,
+        1,    // target_system
+        0,    // target_component
+        roll, pitch, throttle, yaw,
+        0, 0, 0, 0  // channels 5-8
+    );
+    
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    pixhawkSerial.write(buf, len);
+    
+    Serial.printf("RC Override: R:%d P:%d T:%d Y:%d\n", roll, pitch, throttle, yaw);
+}
+
+// ============================================================================
+// CAMERA FUNCTIONS
+// ============================================================================
+void handleJpgStream() {
+    WiFiClient client = server.client();
+    String response = "HTTP/1.1 200 OK\r\n";
+    response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+    server.sendContent(response);
+    
+    while (client.connected()) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+            Serial.println("Camera capture failed");
+            delay(100);
+            continue;
+        }
+        
+        server.sendContent("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ");
+        server.sendContent(String(fb->len));
+        server.sendContent("\r\n\r\n");
+        
+        client.write(fb->buf, fb->len);
+        server.sendContent("\r\n");
+        
+        esp_camera_fb_return(fb);
+        
+        if (!client.connected()) break;
+        delay(30); // ~30 FPS
+    }
+}
+
+// ============================================================================
+// COMPUTER VISION - LINE FOLLOWING
+// ============================================================================
+void performLineFollow() {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Line follow: Camera capture failed");
+        return;
+    }
+    
+    // Simple line following algorithm using horizontal pixel analysis
+    int leftSum = 0, rightSum = 0;
+    int width = fb->width;
+    int height = fb->height;
+    
+    // Analyze bottom third of image for line detection
+    int startRow = height * 2 / 3;
+    int pixelsPerRow = width * 3; // RGB or similar
+    
+    for (int row = startRow; row < height; row++) {
+        for (int col = 0; col < width; col++) {
+            int pixelIndex = (row * width + col) * 3;
+            if (pixelIndex < fb->len) {
+                uint8_t pixelValue = fb->buf[pixelIndex];
+                
+                if (col < width / 2) {
+                    leftSum += pixelValue;
+                } else {
+                    rightSum += pixelValue;
+                }
+            }
+        }
+    }
+    
+    esp_camera_fb_return(fb);
+    
+    // Calculate steering based on line position
+    int error = leftSum - rightSum;
+    int rollAdjustment = constrain(error / 100, -200, 200);
+    int roll = RC_CENTER + rollAdjustment;
+    
+    sendRcOverride(roll, RC_CENTER, droneState.baseThrottle, RC_CENTER);
+    
+    Serial.printf("Line follow: L:%d R:%d E:%d Roll:%d\n", leftSum, rightSum, error, roll);
+}
+
+// ============================================================================
+// OBSTACLE AVOIDANCE
+// ============================================================================
+void checkObstacleAvoidance() {
+    if (!droneState.tofSensorReady) return;
+    
+    VL53L0X_RangingMeasurementData_t measure;
+    tofSensor.rangingTest(&measure, false);
+    
+    if (measure.RangeStatus == 0) { // Valid measurement
+        Serial.printf("Distance: %d mm\n", measure.RangeMilliMeter);
+        
+        if (measure.RangeMilliMeter < TOF_OBSTACLE_DISTANCE) {
+            Serial.println("Obstacle detected! Emergency stop");
+            sendRcOverride(RC_CENTER, RC_CENTER, RC_THROTTLE_MIN, RC_CENTER);
+            
+            // Optionally disable line following when obstacle is detected
+            droneState.lineFollowEnabled = false;
+        }
+    }
+}
+
+// ============================================================================
+// WEB SERVER HANDLERS
+// ============================================================================
+void handleRoot() {
+    server.send(200, "text/html", INDEX_HTML);
+}
+
+void handleVoiceCommand() {
+    if (server.hasArg("cmd")) {
+        String cmd = server.arg("cmd");
+        cmd.toLowerCase();
+        cmd.trim();
+        
+        Serial.println("Voice command: " + cmd);
+        
+        // Parse voice commands
+        if (cmd.indexOf("arm") >= 0 && cmd.indexOf("disarm") < 0) {
+            droneState.armed = true;
+            Serial.println("Voice: ARMED");
+        } else if (cmd.indexOf("disarm") >= 0) {
+            droneState.armed = false;
+            droneState.lineFollowEnabled = false;
+            Serial.println("Voice: DISARMED");
+        } else if (cmd.indexOf("line follow on") >= 0 || cmd.indexOf("line on") >= 0) {
+            droneState.lineFollowEnabled = true;
+            Serial.println("Voice: Line follow ON");
+        } else if (cmd.indexOf("line follow off") >= 0 || cmd.indexOf("line off") >= 0) {
+            droneState.lineFollowEnabled = false;
+            Serial.println("Voice: Line follow OFF");
+        } else if (cmd.indexOf("toggle obstacle") >= 0) {
+            droneState.obstacleAvoidanceEnabled = !droneState.obstacleAvoidanceEnabled;
+            Serial.printf("Voice: Obstacle avoidance %s\n", droneState.obstacleAvoidanceEnabled ? "ON" : "OFF");
+        } else if (cmd.indexOf("stop") >= 0) {
+            droneState.lineFollowEnabled = false;
+            droneState.armed = false;
+            Serial.println("Voice: EMERGENCY STOP");
+        } else if (cmd.indexOf("throttle up") >= 0) {
+            droneState.baseThrottle = constrain(droneState.baseThrottle + THROTTLE_STEP, 1000, 2000);
+            Serial.printf("Voice: Throttle up to %d\n", droneState.baseThrottle);
+        } else if (cmd.indexOf("throttle down") >= 0) {
+            droneState.baseThrottle = constrain(droneState.baseThrottle - THROTTLE_STEP, 1000, 2000);
+            Serial.printf("Voice: Throttle down to %d\n", droneState.baseThrottle);
+        }
+    }
+    
+    server.send(200, "text/plain", "OK");
+}
+
+void setupWebServer() {
+    // Main page
+    server.on("/", handleRoot);
+    
+    // Camera stream
+    server.on("/stream", HTTP_GET, []() {
+        handleJpgStream();
+    });
+    
+    // API endpoints
+    server.on("/api/arm", []() {
+        droneState.armed = true;
+        server.send(200, "text/plain", "ARMED");
+        Serial.println("API: ARMED");
+    });
+    
+    server.on("/api/disarm", []() {
+        droneState.armed = false;
+        droneState.lineFollowEnabled = false;
+        server.send(200, "text/plain", "DISARMED");
+        Serial.println("API: DISARMED");
+    });
+    
+    server.on("/api/line_on", []() {
+        droneState.lineFollowEnabled = true;
+        server.send(200, "text/plain", "LINE_FOLLOW_ON");
+        Serial.println("API: Line follow ON");
+    });
+    
+    server.on("/api/line_off", []() {
+        droneState.lineFollowEnabled = false;
+        server.send(200, "text/plain", "LINE_FOLLOW_OFF");
+        Serial.println("API: Line follow OFF");
+    });
+    
+    server.on("/api/toggle_obstacle", []() {
+        droneState.obstacleAvoidanceEnabled = !droneState.obstacleAvoidanceEnabled;
+        server.send(200, "text/plain", droneState.obstacleAvoidanceEnabled ? "OBSTACLE_ON" : "OBSTACLE_OFF");
+        Serial.printf("API: Obstacle avoidance %s\n", droneState.obstacleAvoidanceEnabled ? "ON" : "OFF");
+    });
+    
+    server.on("/api/stop", []() {
+        droneState.lineFollowEnabled = false;
+        droneState.armed = false;
+        server.send(200, "text/plain", "EMERGENCY_STOP");
+        Serial.println("API: EMERGENCY STOP");
+    });
+    
+    server.on("/api/throttle_up", []() {
+        droneState.baseThrottle = constrain(droneState.baseThrottle + THROTTLE_STEP, 1000, 2000);
+        server.send(200, "text/plain", "THROTTLE_UP_" + String(droneState.baseThrottle));
+        Serial.printf("API: Throttle up to %d\n", droneState.baseThrottle);
+    });
+    
+    server.on("/api/throttle_down", []() {
+        droneState.baseThrottle = constrain(droneState.baseThrottle - THROTTLE_STEP, 1000, 2000);
+        server.send(200, "text/plain", "THROTTLE_DOWN_" + String(droneState.baseThrottle));
+        Serial.printf("API: Throttle down to %d\n", droneState.baseThrottle);
+    });
+    
+    server.on("/api/voice", handleVoiceCommand);
+    
+    server.begin();
+    Serial.println("Web server started");
+}
+
+// ============================================================================
+// HARDWARE INITIALIZATION
+// ============================================================================
+bool initializeCamera() {
+    camera_config_t config;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.pin_d0 = Y2_GPIO_NUM;
+    config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM;
+    config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM;
+    config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM;
+    config.pin_d7 = Y9_GPIO_NUM;
+    config.pin_xclk = XCLK_GPIO_NUM;
+    config.pin_pclk = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href = HREF_GPIO_NUM;
+    config.pin_sscb_sda = SIOD_GPIO_NUM;
+    config.pin_sscb_scl = SIOC_GPIO_NUM;
+    config.pin_pwdn = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_QVGA;  // Improved from QQVGA
+    config.jpeg_quality = 10;            // Improved quality
+    config.fb_count = 2;                 // Double buffering
+    
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x\n", err);
+        return false;
+    }
+    
+    Serial.println("Camera initialized successfully");
+    return true;
+}
+
+bool initializeTofSensor() {
+    Wire.begin();
+    if (tofSensor.begin()) {
+        droneState.tofSensorReady = true;
+        Serial.println("ToF sensor initialized successfully");
+        return true;
+    } else {
+        Serial.println("Failed to initialize ToF sensor");
+        return false;
+    }
+}
+
+void initializeWiFi() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+    
+    Serial.println("WiFi AP started");
+    Serial.print("SSID: ");
+    Serial.println(WIFI_SSID);
+    Serial.print("Password: ");
+    Serial.println(WIFI_PASSWORD);
+    Serial.print("AP IP address: ");
+    Serial.println(WiFi.softAPIP());
+}
+
+// ============================================================================
+// MAIN SETUP FUNCTION
+// ============================================================================
+void setup() {
+    Serial.begin(SERIAL_BAUD_RATE);
+    Serial.println("ESP32-CAM Drone Controller Starting...");
+    
+    // Initialize UART for MAVLink communication
+    pixhawkSerial.begin(MAVLINK_BAUD_RATE, SERIAL_8N1, RXD2, TXD2);
+    Serial.println("MAVLink UART initialized");
+    
+    // Initialize WiFi Access Point
+    initializeWiFi();
+    
+    // Initialize camera
+    if (!initializeCamera()) {
+        Serial.println("Critical error: Camera initialization failed");
+        ESP.restart();
+    }
+    
+    // Initialize ToF sensor (non-critical)
+    initializeTofSensor();
+    
+    // Start web server
+    setupWebServer();
+    
+    Serial.println("=== ESP32-CAM Drone Controller Ready ===");
+    Serial.printf("Base throttle: %d\n", droneState.baseThrottle);
+    Serial.printf("ToF sensor: %s\n", droneState.tofSensorReady ? "Ready" : "Not available");
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+    server.handleClient();
+    
+    if (droneState.armed) {
+        if (droneState.lineFollowEnabled) {
+            performLineFollow();
+        } else {
+            // Hover mode
+            sendRcOverride(RC_CENTER, RC_CENTER, droneState.baseThrottle, RC_CENTER);
+        }
+        
+        if (droneState.obstacleAvoidanceEnabled) {
+            checkObstacleAvoidance();
+        }
+    } else {
+        // Send safe values when disarmed
+        sendRcOverride(RC_CENTER, RC_CENTER, 1000, RC_CENTER);
+    }
+    
+    delay(50); // 20Hz control loop
+}
