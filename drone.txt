@@ -1,4 +1,4 @@
-//                                                                                                           🔥 CODE BY SIDDHARTHAN & SHRI HARI 🔥
+//                                                                                                         #### CODE BY SIDDHARTHAN & SHRI HARI #### 
 /*
  * ESP32-CAM Drone Controller
  * 
@@ -154,36 +154,36 @@ const char* INDEX_HTML PROGMEM = R"rawliteral(
 </head>
 <body>
     <div class="container">
-        <h1>🚁 ESP32-CAM Drone Controller</h1>
+        <h1> ESP32-CAM Drone Controller</h1>
         
         <div class="control-section">
-            <h3>📹 Video Stream</h3>
+            <h3> Video Stream</h3>
             <img id="video" src="/stream" alt="Camera Stream">
         </div>
         
         <div class="control-section">
-            <h3>🛡️ Safety Controls</h3>
+            <h3> Safety Controls</h3>
             <button onclick="sendCmd('arm')">ARM</button>
             <button onclick="sendCmd('disarm')" class="danger">DISARM</button>
             <button onclick="sendCmd('stop')" class="danger">EMERGENCY STOP</button>
         </div>
         
         <div class="control-section">
-            <h3>🎯 Flight Modes</h3>
+            <h3> Flight Modes</h3>
             <button onclick="sendCmd('line_on')">Line Follow ON</button>
             <button onclick="sendCmd('line_off')">Line Follow OFF</button>
             <button onclick="sendCmd('toggle_obstacle')">Toggle Obstacle Avoidance</button>
         </div>
         
         <div class="control-section">
-            <h3>⚡ Throttle Control</h3>
+            <h3> Throttle Control</h3>
             <button onclick="sendCmd('throttle_up')">Throttle +</button>
             <button onclick="sendCmd('throttle_down')">Throttle -</button>
         </div>
         
         <div class="control-section">
-            <h3>🎤 Voice Control</h3>
-            <button id="micBtn">🎤 Voice Command</button>
+            <h3> Voice Control</h3>
+            <button id="micBtn"> Voice Command</button>
             <div id="voiceStatus">Voice: Ready</div>
             <div style="font-size: 12px; color: #888; margin-top: 10px;">
                 Commands: "arm", "disarm", "line follow on/off", "toggle obstacle", "stop", "throttle up/down"
@@ -607,4 +607,5 @@ void loop() {
     delay(50); // 20Hz control loop
 
 }
+
 
